@@ -1,0 +1,3 @@
+[submodule "AlphaChat"]
+	path = AlphaChat
+	url = https://github.com/AlphaChat/ConfigPydle/
