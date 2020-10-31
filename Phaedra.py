@@ -36,14 +36,32 @@ from datetime import datetime, timezone
 from publicsuffixlist import PublicSuffixList
 
 import aiodns
+import aiohttp
 import asyncio
 import base64
 import binascii
+import email.utils
 import hashlib
 import hmac
+import os
 import re
-import textwrap
+import signal
 import sys
+import textwrap
+
+PSLURI = 'https://publicsuffix.org/list/public_suffix_list.dat'
+
+
+
+def httptime_to_timestamp(htime):
+
+	return email.utils.parsedate_to_datetime(htime).timestamp()
+
+
+
+def timestamp_to_httptime(stamp):
+
+	return email.utils.formatdate(timeval=stamp, localtime=False, usegmt=True)
 
 
 
@@ -54,11 +72,14 @@ class Client(configpydle.Client):
 		super().__init__(*args, eventloop=eventloop, **kwargs)
 
 		self.eventloop      = eventloop
+		self.http_session   = aiohttp.ClientSession()
 		self.request_expr   = re.compile('^VHOSTREQ ([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+)$')
 		self.resolver       = aiodns.DNSResolver(timeout=1, tries=3, domains=[], rotate=True,
 		                                         loop=eventloop)
-		self.wrapper        = textwrap.TextWrapper(width=64, expand_tabs=False, tabsize=1,
+		self.suffix_list    = None
+		self.text_wrapper   = textwrap.TextWrapper(width=64, expand_tabs=False, tabsize=1,
 		                                           replace_whitespace=True, drop_whitespace=True)
+		self.update_lock    = asyncio.Lock()
 
 
 
@@ -66,12 +87,38 @@ class Client(configpydle.Client):
 
 		while self.connected:
 
-			await asyncio.sleep(0.05)
+			await asyncio.sleep(0.1)
 			if not self.autoperform_done:
 				continue
 
 			if not self.in_channel(self.phcfg['log_channel']):
 				await self.join(self.phcfg['log_channel'])
+
+
+
+	async def update_list(self):
+
+		while self.connected:
+
+			await asyncio.sleep(0.1)
+			if not self.autoperform_done:
+				continue
+
+			current_ts = int(datetime.now(tz=timezone.utc).timestamp())
+			update_interval = self.phcfg['update_interval']
+			await asyncio.sleep(update_interval - (current_ts % update_interval))
+			while self.connected and not self.in_channel(self.phcfg['log_channel']):
+				# The check_membership() task above will take care of this
+				await asyncio.sleep(0.1)
+
+			async with self.update_lock:
+				if self.connected:
+					try:
+						await self.do_update_list()
+					except Exception as e:
+						await self.oper_message(f'\x0304Exception while updating and/or ' \
+						                        f'parsing the Public Suffix List: ' \
+						                        f'{str(e)}\x03')
 
 
 
@@ -85,6 +132,13 @@ class Client(configpydle.Client):
 	async def on_connect(self):
 
 		await super().on_connect()
+
+		async with self.update_lock:
+			try:
+				await self.do_update_list()
+			except Exception as e:
+				await self.oper_message(f'\x0304Exception while updating and/or parsing the ' \
+				                        f'Public Suffix List: {str(e)}\x03')
 
 		self.eventloop.add_signal_handler(signal.SIGTERM,
 		                                  lambda self=self: asyncio.create_task(self.sigterm_handler()))
@@ -122,10 +176,14 @@ class Client(configpydle.Client):
 		await self.oper_message(f'The user \x02{nickname}\x02 (account \x02{account}\x02) has ' \
 		                        f'requested the vHost \x02{vhost}\x02.')
 
+		if self.suffix_list is None:
+			await self.oper_message(f'\x0304I am unable to match this request against the Public ' \
+			                        f'Suffix List because I have failed to parse the list in the ' \
+			                        f'past. \x02Please review the request manually.\x02\x03')
+			return
+
 		try:
-			with open(self.phcfg['public_suffix_path'], 'rb') as f:
-				psl = PublicSuffixList(source=f, accept_unknown=False, only_icann=False)
-				suffix = psl.privatesuffix(vhost)
+			suffix = self.suffix_list.privatesuffix(vhost)
 		except Exception as e:
 			await self.oper_message(f'\x0304Exception while matching \x02{vhost}\x02 against the ' \
 			                        f'Public Suffix List: {str(e)}\x03')
@@ -212,6 +270,65 @@ class Client(configpydle.Client):
 
 
 
+	async def do_update_list(self):
+
+		headers = {}
+		pslpath = self.phcfg['public_suffix_path']
+		tmppath = pslpath + '.tmp'
+
+		try:
+			mtime = os.path.getmtime(pslpath)
+			htime = timestamp_to_httptime(mtime)
+			headers['If-Modified-Since'] = htime
+		except:
+			pass
+
+		async with self.http_session.get(PSLURI, headers=headers) as resp:
+			if resp.status == 304:
+				if not self.suffix_list:
+					with open(pslpath, 'rb') as f:
+						PSL = PublicSuffixList(source=f, accept_unknown=False, only_icann=False)
+						if PSL.privatesuffix('foo.bar.baz.example.net') == 'example.net':
+							self.suffix_list = PSL
+						else:
+							raise Exception('Testcase failed')
+			else:
+				if resp.status != 200:
+					raise Exception(f'Received HTTP response with status code {resp.status}; ' \
+					                f'expected status code 200')
+
+				if not 'Last-Modified' in resp.headers:
+					raise Exception(f'Received HTTP response without a Last-Modified header')
+
+				with open(tmppath, 'wb') as f:
+					while True:
+						chunk = await resp.content.read(1024)
+						if chunk:
+							f.write(chunk)
+						else:
+							break
+
+					f.flush()
+					os.fsync(f.fileno())
+					f.close()
+
+				htime = resp.headers['Last-Modified']
+				mtime = httptime_to_timestamp(htime)
+				os.utime(tmppath, (mtime, mtime))
+
+				with open(tmppath, 'rb') as f:
+					PSL = PublicSuffixList(source=f, accept_unknown=False, only_icann=False)
+					if PSL.privatesuffix('foo.bar.baz.example.net') == 'example.net':
+						self.suffix_list = PSL
+					else:
+						raise Exception('Testcase failed')
+
+				os.replace(tmppath, pslpath)
+				await self.oper_message(f'\x0303Updated Public Suffix List (Last-Modified: ' \
+				                        f'"{htime}")\x03')
+
+
+
 	async def message(self, target, message, wrap=True):
 
 		if message == '':
@@ -223,7 +340,7 @@ class Client(configpydle.Client):
 			return
 
 		await super().message(target, ' ')
-		for line in self.wrapper.wrap(message):
+		for line in self.text_wrapper.wrap(message):
 			await super().message(target, line)
 
 
@@ -312,15 +429,19 @@ async def main():
 		'hostserv_nickname',
 		'log_channel',
 		'public_suffix_path',
+		'update_interval',
 		'validator_netname',
 		'validator_secret',
 	]
 
-	eventloop = asyncio.get_running_loop()
-	client = Client(path='client.cfg', eventloop=eventloop, required_config_keys=required_config_keys)
-
-	await client.connect()
-	await asyncio.gather(client.check_membership(), return_exceptions=True)
+	try:
+		eventloop = asyncio.get_running_loop()
+		client = Client(path='client.cfg', eventloop=eventloop, required_config_keys=required_config_keys)
+		await client.connect()
+		await asyncio.gather(client.check_membership(), client.update_list(), return_exceptions=True)
+	except Exception as e:
+		print(f'Exception: {str(e)}', file=sys.stderr)
+		return
 
 
 
