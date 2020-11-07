@@ -94,6 +94,9 @@ class Client(configpydle.Client):
 			if not self.in_channel(self.phcfg['log_channel']):
 				await self.join(self.phcfg['log_channel'])
 
+			if not self.in_channel(self.phcfg['oper_channel']):
+				await self.join(self.phcfg['oper_channel'])
+
 
 
 	async def update_list(self):
@@ -116,9 +119,9 @@ class Client(configpydle.Client):
 					try:
 						await self.do_update_list()
 					except Exception as e:
-						await self.oper_message(f'\x0304Exception while updating and/or ' \
-						                        f'parsing the Public Suffix List: ' \
-						                        f'{str(e)}\x03')
+						await self.log_message(f'\x0304Exception while updating and/or ' \
+						                       f'parsing the Public Suffix List: ' \
+						                       f'{str(e)}\x03')
 
 
 
@@ -137,8 +140,8 @@ class Client(configpydle.Client):
 			try:
 				await self.do_update_list()
 			except Exception as e:
-				await self.oper_message(f'\x0304Exception while updating and/or parsing the ' \
-				                        f'Public Suffix List: {str(e)}\x03')
+				await self.log_message(f'\x0304Exception while updating and/or parsing the ' \
+				                       f'Public Suffix List: {str(e)}\x03')
 
 		self.eventloop.add_signal_handler(signal.SIGTERM,
 		                                  lambda self=self: asyncio.create_task(self.sigterm_handler()))
@@ -150,6 +153,9 @@ class Client(configpydle.Client):
 		await super().on_join(channel, user)
 
 		if self.is_same_channel(channel, self.phcfg['log_channel']):
+			return
+
+		if self.is_same_channel(channel, self.phcfg['oper_channel']):
 			return
 
 		await self.part(channel)
@@ -324,8 +330,8 @@ class Client(configpydle.Client):
 						raise Exception('Testcase failed')
 
 				os.replace(tmppath, pslpath)
-				await self.oper_message(f'\x0303Updated Public Suffix List (Last-Modified: ' \
-				                        f'"{htime}")\x03')
+				await self.log_message(f'\x0303Updated Public Suffix List (Last-Modified: ' \
+				                       f'"{htime}")\x03')
 
 
 
@@ -345,9 +351,15 @@ class Client(configpydle.Client):
 
 
 
+	async def log_message(self, message):
+
+		await super().message(self.phcfg['log_channel'], message)
+
+
+
 	async def oper_message(self, message):
 
-		await self.notice(self.phcfg['log_channel'], message)
+		await self.notice(self.phcfg['oper_channel'], message)
 
 
 
@@ -428,6 +440,7 @@ async def main():
 	required_config_keys = [
 		'hostserv_nickname',
 		'log_channel',
+		'oper_channel',
 		'public_suffix_path',
 		'update_interval',
 		'validator_netname',
