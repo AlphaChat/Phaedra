@@ -49,46 +49,35 @@ import signal
 import sys
 import textwrap
 
-PSLURI = 'https://publicsuffix.org/list/public_suffix_list.dat'
-
-
-
-def httptime_to_timestamp(htime):
-
-	return email.utils.parsedate_to_datetime(htime).timestamp()
-
-
-
-def timestamp_to_httptime(stamp):
-
-	return email.utils.formatdate(timeval=stamp, localtime=False, usegmt=True)
-
-
-
 class Client(configpydle.Client):
 
-	def __init__(self, *args, eventloop=None, **kwargs):
+	def __init__(self, *args, **kwargs):
 
-		super().__init__(*args, eventloop=eventloop, **kwargs)
+		super().__init__(*args, **kwargs)
 
-		self.eventloop      = eventloop
-		self.http_session   = aiohttp.ClientSession()
-		self.request_expr   = re.compile('^VHOSTREQ ([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+)$')
-		self.resolver       = aiodns.DNSResolver(timeout=1, tries=3, domains=[], rotate=True,
-		                                         loop=eventloop)
-		self.suffix_list    = None
-		self.text_wrapper   = textwrap.TextWrapper(width=64, expand_tabs=False, tabsize=1,
-		                                           replace_whitespace=True, drop_whitespace=True)
-		self.update_lock    = asyncio.Lock()
+		self.request_expr       = re.compile('^VHOSTREQ ([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+)$')
+
+		self.resolver           = aiodns.DNSResolver(timeout=1, tries=3, domains=[], rotate=True,
+		                                             loop=self.eventloop)
+
+		self.text_wrapper       = textwrap.TextWrapper(width=64, expand_tabs=False, tabsize=1,
+		                                               replace_whitespace=True, drop_whitespace=True)
+
+		self.ev_tasks           = None
+		self.http_session       = None
+		self.suffix_list        = None
+		self.update_lock        = asyncio.Lock()
+
+		handler = lambda self=self : self.eventloop.create_task(self.sigterm_handler())
+		self.eventloop.add_signal_handler(signal.SIGTERM, handler)
 
 
 
 	async def check_membership(self):
 
-		while self.connected:
+		while await asyncio.sleep(0.1, result=True):
 
-			await asyncio.sleep(0.1)
-			if not self.autoperform_done:
+			if not self.connected or not self.autoperform_done:
 				continue
 
 			if not self.in_channel(self.phcfg['log_channel']):
@@ -99,12 +88,11 @@ class Client(configpydle.Client):
 
 
 
-	async def update_list(self):
+	async def update_suffix_list(self):
 
-		while self.connected:
+		while await asyncio.sleep(0.1, result=True):
 
-			await asyncio.sleep(0.1)
-			if not self.autoperform_done:
+			if not self.connected or not self.autoperform_done:
 				continue
 
 			current_ts = int(datetime.now(tz=timezone.utc).timestamp())
@@ -116,19 +104,43 @@ class Client(configpydle.Client):
 
 			async with self.update_lock:
 				if self.connected:
-					try:
-						await self.do_update_list()
-					except Exception as e:
-						await self.log_message(f'\x0304Exception while updating and/or ' \
-						                       f'parsing the Public Suffix List: ' \
-						                       f'{str(e)}\x03')
+					await self.do_update_suffix_list()
 
 
 
 	async def sigterm_handler(self):
 
-		if self.connected:
+		async with self.update_lock:
+
+			await self.cleanup_tasks()
+
+			# It's necessary to sleep for a short while after closing the HTTP session so
+			# that TLS close_notify alerts get processed and connections get closed cleanly.
+			if self.http_session is not None:
+				await self.http_session.close()
+				await asyncio.sleep(1)
+				self.http_session = None
+
 			await self.quit('Received SIGTERM')
+
+			self.eventloop.remove_signal_handler(signal.SIGTERM)
+			self.eventloop.stop()
+
+
+
+	async def cleanup_tasks(self):
+
+		if self.ev_tasks is None:
+			return
+
+		for task in self.ev_tasks:
+			try:
+				task.cancel()
+				await task
+			except:
+				pass
+
+		self.ev_tasks = None
 
 
 
@@ -136,15 +148,23 @@ class Client(configpydle.Client):
 
 		await super().on_connect()
 
-		async with self.update_lock:
-			try:
-				await self.do_update_list()
-			except Exception as e:
-				await self.log_message(f'\x0304Exception while updating and/or parsing the ' \
-				                       f'Public Suffix List: {str(e)}\x03')
+		if self.ev_tasks is None:
+			self.ev_tasks = [
+				self.eventloop.create_task(self.check_membership()),
+				self.eventloop.create_task(self.update_suffix_list())
+			]
 
-		self.eventloop.add_signal_handler(signal.SIGTERM,
-		                                  lambda self=self: asyncio.create_task(self.sigterm_handler()))
+		if self.suffix_list is None:
+			async with self.update_lock:
+				await self.do_update_suffix_list()
+
+
+
+	async def on_disconnect(self, expected):
+
+		await super().on_disconnect(expected)
+
+		await self.cleanup_tasks()
 
 
 
@@ -166,7 +186,7 @@ class Client(configpydle.Client):
 
 		await super().on_private_message(target, source, message)
 
-		if not source == self.phcfg['hostserv_nickname']:
+		if source != self.phcfg['hostserv_nickname']:
 			return
 
 		matches = self.request_expr.fullmatch(message)
@@ -190,14 +210,13 @@ class Client(configpydle.Client):
 
 		try:
 			suffix = self.suffix_list.privatesuffix(vhost)
+			if suffix is None:
+				await self.oper_message(f'\x0308It does not match the Public Suffix List; ' \
+				                        f'please consider activating it.\x03')
+				return
 		except Exception as e:
 			await self.oper_message(f'\x0304Exception while matching \x02{vhost}\x02 against the ' \
 			                        f'Public Suffix List: {str(e)}\x03')
-			return
-
-		if suffix is None:
-			await self.oper_message(f'\x0308It does not match the Public Suffix List; ' \
-			                        f'please consider activating it.\x03')
 			return
 
 		try:
@@ -276,7 +295,30 @@ class Client(configpydle.Client):
 
 
 
-	async def do_update_list(self):
+	def httptime_to_timestamp(self, htime):
+
+		return email.utils.parsedate_to_datetime(htime).timestamp()
+
+
+
+	def timestamp_to_httptime(self, stamp):
+
+		return email.utils.formatdate(timeval=stamp, localtime=False, usegmt=True)
+
+
+
+	def do_load_list(self, path):
+
+		with open(path, 'rb') as f:
+			PSL = PublicSuffixList(source=f, accept_unknown=False, only_icann=False)
+			if PSL.privatesuffix('foo.bar.baz.example.net') == 'example.net':
+				self.suffix_list = PSL
+			else:
+				raise Exception('Public Suffix List testcase failed')
+
+
+
+	async def do_update_suffix_list(self):
 
 		headers = {}
 		pslpath = self.phcfg['public_suffix_path']
@@ -284,21 +326,22 @@ class Client(configpydle.Client):
 
 		try:
 			mtime = os.path.getmtime(pslpath)
-			htime = timestamp_to_httptime(mtime)
+			htime = self.timestamp_to_httptime(mtime)
 			headers['If-Modified-Since'] = htime
 		except:
 			pass
 
-		async with self.http_session.get(PSLURI, headers=headers) as resp:
-			if resp.status == 304:
-				if not self.suffix_list:
-					with open(pslpath, 'rb') as f:
-						PSL = PublicSuffixList(source=f, accept_unknown=False, only_icann=False)
-						if PSL.privatesuffix('foo.bar.baz.example.net') == 'example.net':
-							self.suffix_list = PSL
-						else:
-							raise Exception('Testcase failed')
-			else:
+		try:
+			if self.http_session is None:
+				self.http_session = aiohttp.ClientSession()
+
+			async with self.http_session.get(self.phcfg['update_uri'], headers=headers) as resp:
+
+				if resp.status == 304:
+					if self.suffix_list is None:
+						self.do_load_list(pslpath)
+					return
+
 				if resp.status != 200:
 					raise Exception(f'Received HTTP response with status code {resp.status}; ' \
 					                f'expected status code 200')
@@ -308,7 +351,7 @@ class Client(configpydle.Client):
 
 				with open(tmppath, 'wb') as f:
 					while True:
-						chunk = await resp.content.read(1024)
+						chunk = await resp.content.read(4096)
 						if chunk:
 							f.write(chunk)
 						else:
@@ -319,19 +362,16 @@ class Client(configpydle.Client):
 					f.close()
 
 				htime = resp.headers['Last-Modified']
-				mtime = httptime_to_timestamp(htime)
+				mtime = self.httptime_to_timestamp(htime)
 				os.utime(tmppath, (mtime, mtime))
-
-				with open(tmppath, 'rb') as f:
-					PSL = PublicSuffixList(source=f, accept_unknown=False, only_icann=False)
-					if PSL.privatesuffix('foo.bar.baz.example.net') == 'example.net':
-						self.suffix_list = PSL
-					else:
-						raise Exception('Testcase failed')
-
+				self.do_load_list(tmppath)
 				os.replace(tmppath, pslpath)
-				await self.log_message(f'\x0303Updated Public Suffix List (Last-Modified: ' \
-				                       f'"{htime}")\x03')
+
+			await self.log_message(f'\x0303Updated Public Suffix List (Last-Modified: {htime}")\x03')
+
+		except Exception as e:
+			await self.log_message(f'\x0304Exception {type(e)} while updating the Public Suffix List: ' \
+			                       f'{str(e)}\x03')
 
 
 
@@ -353,7 +393,7 @@ class Client(configpydle.Client):
 
 	async def log_message(self, message):
 
-		await super().message(self.phcfg['log_channel'], message)
+		await self.message(self.phcfg['log_channel'], message, wrap=False)
 
 
 
@@ -435,7 +475,7 @@ class Client(configpydle.Client):
 
 
 
-async def main():
+def main():
 
 	required_config_keys = [
 		'hostserv_nickname',
@@ -443,21 +483,16 @@ async def main():
 		'oper_channel',
 		'public_suffix_path',
 		'update_interval',
+		'update_uri',
 		'validator_netname',
 		'validator_secret',
 	]
 
-	try:
-		eventloop = asyncio.get_running_loop()
-		client = Client(path='client.cfg', eventloop=eventloop, required_config_keys=required_config_keys)
-		await client.connect()
-		await asyncio.gather(client.check_membership(), client.update_list(), return_exceptions=True)
-	except Exception as e:
-		print(f'Exception: {str(e)}', file=sys.stderr)
-		return
+	client = Client(path='client.cfg', required_config_keys=required_config_keys)
+	client.run()
 
 
 
 if __name__ == '__main__':
-	asyncio.run(main())
+	main()
 	sys.exit(1)
