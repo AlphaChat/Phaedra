@@ -367,7 +367,7 @@ class Client(configpydle.Client):
 				self.do_load_list(tmppath)
 				os.replace(tmppath, pslpath)
 
-			await self.log_message(f'\x0303Updated Public Suffix List (Last-Modified: {htime}")\x03')
+			await self.log_message(f'\x0303Updated Public Suffix List (Last-Modified: {htime})\x03')
 
 		except Exception as e:
 			await self.log_message(f'\x0304Exception {type(e)} while updating the Public Suffix List: ' \
