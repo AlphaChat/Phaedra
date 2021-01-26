@@ -477,6 +477,11 @@ class Client(configpydle.Client):
 
 def main():
 
+	default_config_keys = {
+		'update_interval':      '3600',
+		'update_uri':           'https://publicsuffix.org/list/public_suffix_list.dat',
+	}
+
 	required_config_keys = [
 		'hostserv_nickname',
 		'log_channel',
@@ -488,7 +493,9 @@ def main():
 		'validator_secret',
 	]
 
-	client = Client(path='client.cfg', required_config_keys=required_config_keys)
+	client = Client(path='client.cfg',
+	                default_config_keys=default_config_keys,
+	                required_config_keys=required_config_keys)
 	client.run()
 
 
