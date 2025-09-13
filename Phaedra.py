@@ -33,6 +33,7 @@
 
 import aiodns
 import aiohttp
+import argparse
 import asyncio
 import base64
 import binascii
@@ -419,9 +420,10 @@ if __name__ == '__main__':
 		'validator_secret',
 	]
 
-	client = PhaedraClient(path='client.cfg',
-	                       default_config_keys=default_config_keys,
-	                       required_config_keys=required_config_keys)
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--config', default='client.yaml')
+	args = parser.parse_args()
 
+	client = PhaedraClient(args.config, default_config_keys, required_config_keys)
 	client.run()
 	sys.exit(1)
