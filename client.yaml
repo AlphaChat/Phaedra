@@ -1,0 +1,53 @@
+# IRC server connection details
+#
+hostname:               'irc.alphachat.net'
+tls_client_cert:        'client.crt'
+tls_client_cert_key:    'client.key'
+password:               'redacted'
+username:               'phaedra'
+realname:               'AlphaChat vHost Request Management & Approval Bot'
+nickname:               'Phaedra'
+oper_username:          'Phaedra'
+oper_password:          'redacted'
+connect_modes:          '+DQRgi-sx'
+away_message:           'I am a robot; your messages will be forever ignored.'
+
+
+# Optional:  The path to store the Public Suffix List.  Write permission on its directory is also
+# required.  Defaults to "public_suffix_list.dat".
+#
+public_suffix_path:     '/home/phaedra/data/public_suffix_list.dat'
+
+
+# Optional:  The URL of a proxy to use to fetch the Public Suffix List.  Useful if this machine has an
+# outbound firewall that does not permit the user to fetch the list directly.  Any URL scheme supported
+# by aiohttp can be used.  A direct connection will be used if this value is absent or "none".
+# Defaults to absent.
+#
+proxy_url:              'https://bastion.alphachat.net:843'
+
+
+# The channel to log updates of the Public Suffix List to
+#
+log_channel:            '#services'
+
+
+# The channel to tell opers about vHost requests
+#
+oper_channel:           '#opers'
+
+
+# The network name used to derive TXT record contents and that is required in the RRNAME.  For a
+# network name of "foonet", the TXT record required to prove ownership over "example.net" will be
+# called "foonet-dcv.example.net"
+#
+# It is recommended that this be entirely lower case
+#
+validator_netname:      'changeme'
+
+
+# The PBKDF2 secret key used to derive TXT record contents.  Changing this value will invalidate all
+# existing control records, requiring users to create new records in the future if they subsequently
+# request new vHosts under the same domain names.
+#
+validator_secret:       'ChangeMe'

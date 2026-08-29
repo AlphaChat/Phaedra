@@ -41,25 +41,13 @@ import email.utils
 import hashlib
 import hmac
 import os
-import publicsuffix2
 import re
 import signal
 import sys
 
 from AlphaChat.ConfigPydle import ConfigPydleClient
 from datetime import datetime, timezone
-
-
-
-def emu_httptime_to_timestamp(htime):
-
-	return email.utils.parsedate_to_datetime(htime).timestamp()
-
-
-
-def emu_timestamp_to_httptime(stamp):
-
-	return email.utils.formatdate(timeval=stamp, localtime=False, usegmt=True)
+from publicsuffix2 import PublicSuffixList
 
 
 
@@ -69,9 +57,9 @@ class PhaedraClient(ConfigPydleClient):
 
 		super().__init__(*args, **kwargs)
 
-		self.request_expr       = re.compile('^VHOSTREQ ([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+)$')
+		self.request_expr       = re.compile(r'^VHOSTREQ ([^ ]+) ([^ ]+) ([^ ]+) ([^ ]+)$')
 		self.resolver           = aiodns.DNSResolver(timeout=1, tries=3, domains=[], rotate=True)
-		self.http_session       = None
+		self.http_client        = None
 		self.suffix_list        = None
 		self.suffix_lock        = asyncio.Lock()
 
@@ -80,25 +68,39 @@ class PhaedraClient(ConfigPydleClient):
 
 
 
+	def emu_httptime_to_timestamp(self, htime):
+
+		return email.utils.parsedate_to_datetime(htime).timestamp()
+
+
+
+	def emu_timestamp_to_httptime(self, stamp):
+
+		return email.utils.formatdate(timeval=stamp, localtime=False, usegmt=True)
+
+
+
 	def compute_challenge_token(self, secret, netname, entity, account, suffix):
 
 		# Entirely arbitrary derivation mechanics
 		pk = f'netname={netname},entity={entity},account={account},suffix={suffix}'
-		dk = hashlib.pbkdf2_hmac('sha256', secret.encode('utf-8'), pk.encode('utf-8'), 1000, dklen=42)
+		dk = hashlib.pbkdf2_hmac('sha256', secret.encode('utf-8'), pk.encode('utf-8'), 1000)
 		tk = base64.b64encode(dk).decode('utf-8')
 
 		return (netname + '-dcv.' + suffix, tk)
 
 
 
-	def do_load_list(self, path):
+	def load_suffix_list(self, path):
 
 		with open(path, 'r') as f:
-			suffix_list_candidate = publicsuffix2.PublicSuffixList(psl_file=f, idna=True)
-			if suffix_list_candidate.get_sld('foo.bar.baz.example.net', strict=True) == 'example.net':
-				self.suffix_list = suffix_list_candidate
-			else:
+
+			suffix_list_candidate = PublicSuffixList(psl_file=f, idna=True)
+
+			if suffix_list_candidate.get_sld('foo.bar.baz.example.net', strict=True) != 'example.net':
 				raise Exception('Public Suffix List testcase failed')
+
+			self.suffix_list = suffix_list_candidate
 
 
 
@@ -114,20 +116,7 @@ class PhaedraClient(ConfigPydleClient):
 
 
 
-	async def update_list(self):
-
-		while await asyncio.sleep(1, result=True):
-
-			current_ts = int(datetime.now(tz=timezone.utc).timestamp())
-			update_interval = self.acconfig['update_interval']
-			await asyncio.sleep(update_interval - (current_ts % update_interval))
-
-			async with self.suffix_lock:
-				await self.do_update_list()
-
-
-
-	async def do_update_list(self):
+	async def update_suffix_list(self):
 
 		headers = {}
 		pslpath = self.acconfig['public_suffix_path']
@@ -135,23 +124,17 @@ class PhaedraClient(ConfigPydleClient):
 
 		try:
 			mtime = os.path.getmtime(pslpath)
-			htime = emu_timestamp_to_httptime(mtime)
+			htime = self.emu_timestamp_to_httptime(mtime)
 			headers['If-Modified-Since'] = htime
 		except:
 			pass
 
 		try:
-			if self.http_session is None:
-				if 'proxy_url' in self.acconfig:
-					self.http_session = aiohttp.ClientSession(proxy=self.acconfig['proxy_url'])
-				else:
-					self.http_session = aiohttp.ClientSession()
-
-			async with self.http_session.get(self.acconfig['update_uri'], headers=headers) as resp:
+			async with self.http_client.get(self.acconfig['update_uri'], headers=headers) as resp:
 
 				if resp.status == 304:
 					if self.suffix_list is None:
-						self.do_load_list(pslpath)
+						self.load_suffix_list(pslpath)
 					return
 
 				if resp.status != 200:
@@ -174,9 +157,9 @@ class PhaedraClient(ConfigPydleClient):
 					f.close()
 
 				htime = resp.headers['Last-Modified']
-				mtime = emu_httptime_to_timestamp(htime)
+				mtime = self.emu_httptime_to_timestamp(htime)
 				os.utime(tmppath, (mtime, mtime))
-				self.do_load_list(tmppath)
+				self.load_suffix_list(tmppath)
 				os.replace(tmppath, pslpath)
 
 			suffixcnt = len(self.suffix_list.tlds)
@@ -184,9 +167,29 @@ class PhaedraClient(ConfigPydleClient):
 			await self.log_message(f'\x0303Updated Public Suffix List ' \
 			                       f'(Last-Modified: {htime}) (Suffix Count: {suffixcnt})\x03')
 
+		except asyncio.CancelledError:
+			return
+
 		except Exception as e:
 			await self.log_message(f'\x0304Exception {type(e)} while updating the ' \
 			                       f'Public Suffix List: {str(e)}\x03')
+
+
+
+	async def update_suffix_list_task(self):
+
+		try:
+			while await asyncio.sleep(1, result=True):
+
+				current_ts = int(datetime.now(tz=timezone.utc).timestamp())
+				update_interval = self.acconfig['update_interval']
+				await asyncio.sleep(update_interval - (current_ts % update_interval))
+
+				async with self.suffix_lock:
+					await self.update_suffix_list()
+
+		except asyncio.CancelledError:
+			return
 
 
 
@@ -290,14 +293,34 @@ class PhaedraClient(ConfigPydleClient):
 
 
 
-	async def on_raw_001(self, message):
-
-		await super().on_raw_001(message)
+	async def on_autoperform_done(self):
 
 		async with self.suffix_lock:
-			await self.add_ev_task(self.update_list())
-			if self.suffix_list is None:
-				await self.do_update_list()
+
+			if self.http_client is None:
+				self.http_client = aiohttp.ClientSession(proxy=self.acconfig['proxy_url'])
+
+			try:
+				await self.update_suffix_list()
+			except:
+				pass
+
+		await self.add_ev_task(self.update_suffix_list_task())
+
+
+
+	async def on_disconnect(self, expected):
+
+		await super().on_disconnect(expected)
+
+		async with self.suffix_lock:
+
+			if self.http_client is not None:
+
+				await self.http_client.close()
+				await asyncio.sleep(1)
+
+				self.http_client = None
 
 
 
@@ -409,13 +432,12 @@ if __name__ == '__main__':
 		'update_interval':      '7200',
 	        'update_uri':           'https://publicsuffix.org/list/public_suffix_list.dat',
 		'public_suffix_path':   'public_suffix_list.dat',
+		'proxy_url':            None,
 	}
 
 	required_config_keys = [
 		'log_channel',
 		'oper_channel',
-		'update_interval',
-		'update_uri',
 		'validator_netname',
 		'validator_secret',
 	]
